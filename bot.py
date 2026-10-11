@@ -36,6 +36,8 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, send_file
 
@@ -68,6 +70,15 @@ def get_bot_token() -> str:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not configured")
     return BOT_TOKEN
+
+# Telegram runtime configuration.
+TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+TELEGRAM_POLLING_ENABLED = os.environ.get("TELEGRAM_POLLING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "30"))
+STARTUP_MESSAGE = os.environ.get(
+    "STARTUP_MESSAGE",
+    "🟢 UZL BOT HOST STARTED\n\nStatus: Online\nUse /help to see all available commands.\nUse /health for a live health check.",
+)
 
 
 SUPERADMIN_IDS = {
@@ -1397,6 +1408,175 @@ def execute_admin_command(admin_id: str, command: str) -> dict[str, Any]:
         }
 
     return {"ok": False, "message": "Permission denied"}
+
+
+# ============================================================
+# TELEGRAM BOT RUNTIME
+# ============================================================
+
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+
+
+def telegram_api(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Call Telegram Bot API without exposing the bot token in logs."""
+    token = get_bot_token()
+    data = urlencode(payload or {}).encode("utf-8")
+    req = Request(
+        TELEGRAM_API.format(token=token, method=method),
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urlopen(req, timeout=max(10, TELEGRAM_POLL_TIMEOUT + 10)) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def telegram_send(chat_id: str | int, text: str) -> bool:
+    try:
+        result = telegram_api("sendMessage", {"chat_id": str(chat_id), "text": text})
+        return bool(result.get("ok"))
+    except Exception:
+        return False
+
+
+def _is_authorized_telegram_admin(user_id: int) -> bool:
+    # Telegram user IDs are compared as strings because SUPERADMIN_IDS is env-configured.
+    return str(user_id) in SUPERADMIN_IDS
+
+
+def telegram_help_text() -> str:
+    return (
+        "🤖 UZL BOT HOST — COMMANDS\n\n"
+        "General:\n"
+        "/start — Start the bot and show the main menu\n"
+        "/help — Show all usable commands\n"
+        "/health — Live application/config/storage health check\n\n"
+        "Admin:\n"
+        "/admin — Open admin command menu\n"
+        "/admin users — User management section\n"
+        "/admin bots — Bot management section\n"
+        "/admin stats — Dashboard statistics\n"
+        "/admin broadcast — Broadcast section\n"
+        "/admin runners — Runner management section\n"
+        "/admin deployments — Deployment management section\n"
+        "/admin logs — Audit/log section\n"
+        "/admin settings — Permission/settings section\n"
+        "/broadcast — Start broadcast flow\n\n"
+        "🔐 Admin commands require your Telegram user ID to be in SUPERADMIN_IDS."
+    )
+
+
+def telegram_admin_message(user_id: int, command: str) -> str:
+    if not _is_authorized_telegram_admin(user_id):
+        return "⛔ Permission denied."
+
+    result = execute_admin_command(str(user_id), command)
+    if not result.get("ok"):
+        return f"⛔ {result.get('message', 'Permission denied')}"
+
+    if command.strip().lower() == "/admin":
+        return (
+            "🛡️ ADMIN PANEL\n\n"
+            "Available sections:\n"
+            "• /admin users\n"
+            "• /admin bots\n"
+            "• /admin stats\n"
+            "• /admin broadcast\n"
+            "• /admin runners\n"
+            "• /admin deployments\n"
+            "• /admin logs\n"
+            "• /admin settings\n\n"
+            "Use a section command to open it."
+        )
+
+    section = result.get("section")
+    messages = {
+        "users": "👥 USERS\n\nUser management section is available.\nUse the admin web/API interface for view, suspend, unsuspend and delete operations.",
+        "bots": "🤖 BOTS\n\nBot management section is available.\nUse the admin web/API interface for bot start, stop, restart, redeploy, logs and files.",
+        "stats": "📊 STATS\n\nDashboard statistics section is available.\nCurrent in-process users: {users}\nCurrent in-process bots: {bots}\nAudit records: {audit}",
+        "broadcast": "📢 BROADCAST\n\nBroadcast flow:\n1. Audience\n2. Message\n3. Preview\n4. Confirm\n5. Queue\n6. Status\n\nUse /broadcast to open the flow.",
+        "runners": "⚙️ RUNNERS\n\nRunner management section is available.",
+        "deployments": "🚀 DEPLOYMENTS\n\nDeployment management section is available.",
+        "logs": "🧾 LOGS\n\nAudit/log section is available.",
+        "settings": "⚙️ SETTINGS\n\nPermission/settings section is available.",
+    }
+    if section == "stats":
+        return messages[section].format(users=len(USERS), bots=len(BOTS), audit=len(AUDIT_LOGS))
+    return messages.get(section, "✅ Section opened.")
+
+
+def telegram_process_update(update: dict[str, Any]) -> None:
+    message = update.get("message") or update.get("edited_message")
+    if not message or not message.get("text"):
+        return
+    text = str(message["text"]).strip()
+    if not text.startswith("/"):
+        return
+
+    # Telegram may send /command@botname; normalize it.
+    command = text.split()[0].split("@", 1)[0].lower()
+    args = text.split()[1:]
+    user = message.get("from") or {}
+    user_id = int(user.get("id", 0))
+    chat_id = message.get("chat", {}).get("id")
+
+    if command == "/start":
+        reply = (
+            "🟢 UZL BOT HOST ONLINE\n\n"
+            "Welcome! Your bot-host control service is running.\n\n"
+            "Use /help for all usable commands.\n"
+            "Use /health for a live health check."
+        )
+    elif command == "/help":
+        reply = telegram_help_text()
+    elif command == "/health":
+        reply = health_check_command()
+    elif command == "/admin":
+        reply = telegram_admin_message(user_id, "/admin" + (" " + " ".join(args) if args else ""))
+    elif command == "/broadcast":
+        reply = telegram_admin_message(user_id, "/broadcast")
+    else:
+        reply = "❓ Unknown command. Use /help to see all usable commands."
+
+    if chat_id is not None:
+        telegram_send(chat_id, reply)
+
+
+def telegram_polling_worker() -> None:
+    offset = 0
+    while True:
+        try:
+            result = telegram_api(
+                "getUpdates",
+                {"timeout": str(TELEGRAM_POLL_TIMEOUT), "offset": str(offset), "allowed_updates": json.dumps(["message"])},
+            )
+            if not result.get("ok"):
+                time.sleep(5)
+                continue
+            for update in result.get("result", []):
+                offset = max(offset, int(update.get("update_id", 0)) + 1)
+                telegram_process_update(update)
+        except Exception:
+            time.sleep(5)
+
+
+def start_telegram_runtime() -> None:
+    if not TELEGRAM_POLLING_ENABLED or not BOT_TOKEN:
+        return
+    # Avoid starting a second poller if this module is imported more than once.
+    if getattr(start_telegram_runtime, "started", False):
+        return
+    start_telegram_runtime.started = True
+    threading.Thread(target=telegram_polling_worker, daemon=True, name="uzl-telegram-poller").start()
+    if TELEGRAM_ADMIN_CHAT_ID:
+        threading.Thread(
+            target=lambda: telegram_send(TELEGRAM_ADMIN_CHAT_ID, STARTUP_MESSAGE),
+            daemon=True,
+            name="uzl-startup-message",
+        ).start()
+
+
+start_telegram_runtime()
 
 
 # ============================================================
