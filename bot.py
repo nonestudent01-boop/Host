@@ -45,6 +45,10 @@ app = Flask(__name__)
 # CONFIGURATION
 # ============================================================
 
+# Telegram bot token — configure this in Render Environment Variables.
+# Do not hard-code the real token in source code.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
 BOT_STORAGE_ROOT = Path(
     os.environ.get("BOT_STORAGE_ROOT", "./storage/bots")
 ).resolve()
@@ -58,6 +62,13 @@ BROADCAST_MAX_RETRIES = int(os.environ.get("BROADCAST_MAX_RETRIES", "5"))
 BROADCAST_BACKOFF_BASE = float(
     os.environ.get("BROADCAST_BACKOFF_BASE_MS", "2000")
 ) / 1000.0
+
+def get_bot_token() -> str:
+    """Return the configured bot token; never include it in API responses or logs."""
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not configured")
+    return BOT_TOKEN
+
 
 SUPERADMIN_IDS = {
     x.strip()
@@ -95,6 +106,7 @@ SECRET_KEYS = {
     "password",
     "passwd",
     "token",
+    "bot_token",
     "access_token",
     "refresh_token",
     "api_key",
@@ -1238,6 +1250,46 @@ def update_permissions():
 # ============================================================
 # SLASH COMMAND ROUTER
 # ============================================================
+
+def health_check_command() -> str:
+    """
+    Return a safe, non-secret health summary for the bot.
+
+    Intended slash-command behavior:
+        /health
+
+    This does not expose BOT_TOKEN or any other secret.
+    """
+    checks = {
+        "application": "OK",
+        "configuration": "OK" if BOT_TOKEN else "MISSING BOT_TOKEN",
+        "storage": "OK",
+    }
+
+    try:
+        BOT_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        storage_ok = BOT_STORAGE_ROOT.is_dir() and os.access(BOT_STORAGE_ROOT, os.R_OK | os.W_OK)
+        checks["storage"] = "OK" if storage_ok else "ERROR"
+    except Exception:
+        checks["storage"] = "ERROR"
+
+    overall = "HEALTHY" if all(value == "OK" for value in checks.values()) else "DEGRADED"
+
+    return (
+        "🩺 UZL BOT HOST HEALTH CHECK\n"
+        f"Overall: {overall}\n"
+        f"Application: {checks['application']}\n"
+        f"Configuration: {checks['configuration']}\n"
+        f"Storage: {checks['storage']}"
+    )
+
+
+def handle_health_command(command: str) -> str | None:
+    """Handle /health while leaving all existing admin command behavior intact."""
+    if command.strip().split()[0].lower() == "/health":
+        return health_check_command()
+    return None
+
 
 def execute_admin_command(admin_id: str, command: str) -> dict[str, Any]:
     """
