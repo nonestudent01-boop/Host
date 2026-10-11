@@ -744,10 +744,11 @@ def message(update):
 
 @app.post("/telegram/webhook")
 def telegram_webhook():
-    if TELEGRAM_WEBHOOK_SECRET:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
-            return jsonify({"ok": False}), 403
+    if TELEGRAM_WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+        app.logger.warning("Rejected Telegram webhook: bad secret token")
+        return jsonify({"ok": False}), 403
     update = request.get_json(silent=True) or {}
+    app.logger.info("Telegram update received: update_id=%s message=%s callback=%s", update.get("update_id"), bool(update.get("message")), bool(update.get("callback_query")))
     try:
         if update.get("callback_query"):
             callback(update)
@@ -755,6 +756,7 @@ def telegram_webhook():
             message(update)
         return jsonify({"ok": True})
     except Exception as exc:
+        app.logger.exception("Telegram update handling failed: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 @app.get("/health")
@@ -777,20 +779,46 @@ def health():
 def index():
     return jsonify({"service": "UZL BOT HOST", "status": "online"})
 
+@app.get("/telegram-status")
+def telegram_status():
+    return jsonify(verify_telegram())
+
 # ----------------------- webhook setup -------------------------
 
 def configure_webhook():
-    if not BOT_TOKEN or not PUBLIC_BASE_URL:
-        return
-    url = f"{PUBLIC_BASE_URL}/telegram/webhook"
-    payload = {"url": url}
+    if not BOT_TOKEN:
+        app.logger.error("WEBHOOK NOT CONFIGURED: BOT_TOKEN is missing")
+        return False
+    if not PUBLIC_BASE_URL:
+        app.logger.error("WEBHOOK NOT CONFIGURED: PUBLIC_BASE_URL is missing")
+        return False
+    url = f"{PUBLIC_BASE_URL.rstrip('/')}/telegram/webhook"
+    payload = {"url": url, "drop_pending_updates": False}
     if TELEGRAM_WEBHOOK_SECRET:
         payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
     try:
-        tg("setWebhook", payload)
-    except Exception:
-        pass
+        result = tg("setWebhook", payload)
+        app.logger.warning("Telegram webhook configured: %s -> %s", url, result)
+        return bool(result.get("ok"))
+    except Exception as exc:
+        app.logger.exception("Telegram webhook setup failed: %s", exc)
+        return False
+
+def verify_telegram():
+    if not BOT_TOKEN:
+        return {"ok": False, "error": "BOT_TOKEN missing"}
+    try:
+        me = tg("getMe")
+        wh = tg("getWebhookInfo")
+        info = wh.get("result") or {}
+        return {"ok": bool(me.get("ok")), "bot": (me.get("result") or {}).get("username"),
+                "webhook_url": info.get("url", ""), "pending_updates": info.get("pending_update_count", 0),
+                "last_error": info.get("last_error_message", "")}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+configure_webhook()
 
 if __name__ == "__main__":
-    configure_webhook()
+    app.run(host="0.0.0.0", port=PORT)
     app.run(host="0.0.0.0", port=PORT)
