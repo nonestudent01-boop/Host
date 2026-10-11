@@ -1,5 +1,4 @@
-# UZL BOT HOST - Production / Render dependencies
-# Compatible with: bot_final_healthcheck.py
-
 Flask>=3.0,<4.0
 gunicorn>=23.0,<24.0
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]>=3.2,<4.0

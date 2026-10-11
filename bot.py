@@ -1,1613 +1,796 @@
-"""
-UZL BOT HOST - Advanced Admin System
-Single Python backend module.
-
-Designed to be integrated with an existing UZL BOT HOST application.
-This module provides:
-- Server-side RBAC
-- Admin API endpoints
-- Safe bot-scoped file management
-- Audit logging
-- Broadcast queue architecture
-- Admin slash-command routing
-- Secret redaction
-- Rate limiting hooks
-
-Dependencies:
-    pip install flask
-
-Production integration should connect these adapters to the existing
-database, authentication, bot runner, deployment system and notification
-provider.
-"""
-
 from __future__ import annotations
 
+import io
 import json
 import os
-import queue
 import re
-import secrets
+import shutil
+import signal
+import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass, asdict, field
+import zipfile
 from datetime import datetime, timezone
-from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, send_file
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, select, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+# ============================================================
+# UZL BOT HOST — PREMIUM TELEGRAM HOSTING PLATFORM
+# ============================================================
 
 app = Flask(__name__)
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-# Telegram bot token — configure this in Render Environment Variables.
-# Do not hard-code the real token in source code.
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-
-BOT_STORAGE_ROOT = Path(
-    os.environ.get("BOT_STORAGE_ROOT", "./storage/bots")
-).resolve()
-
-MAX_FILE_SIZE = int(
-    os.environ.get("MAX_FILE_SIZE", str(50 * 1024 * 1024))
-)
-
-BROADCAST_BATCH_SIZE = int(os.environ.get("BROADCAST_BATCH_SIZE", "25"))
-BROADCAST_MAX_RETRIES = int(os.environ.get("BROADCAST_MAX_RETRIES", "5"))
-BROADCAST_BACKOFF_BASE = float(
-    os.environ.get("BROADCAST_BACKOFF_BASE_MS", "2000")
-) / 1000.0
-
-def get_bot_token() -> str:
-    """Return the configured bot token; never include it in API responses or logs."""
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not configured")
-    return BOT_TOKEN
-
-# Telegram runtime configuration.
-TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
-TELEGRAM_POLLING_ENABLED = os.environ.get("TELEGRAM_POLLING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-TELEGRAM_POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "30"))
-STARTUP_MESSAGE = os.environ.get(
-    "STARTUP_MESSAGE",
-    "🟢 UZL BOT HOST STARTED\n\nStatus: Online\nUse /help to see all available commands.\nUse /health for a live health check.",
-)
-
-
-SUPERADMIN_IDS = {
-    x.strip()
-    for x in os.environ.get("SUPERADMIN_IDS", "").split(",")
-    if x.strip()
-}
-
-ALL_PERMISSIONS = {
-    "users.view",
-    "users.manage",
-    "bots.view",
-    "bots.manage",
-    "files.view",
-    "files.download",
-    "files.upload",
-    "files.modify",
-    "files.delete",
-    "logs.view",
-    "deployments.manage",
-    "broadcast.send",
-    "runners.manage",
-    "settings.manage",
-}
-
-DEFAULT_ADMIN_PERMISSIONS = {
-    x.strip()
-    for x in os.environ.get(
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///uzl_bot_host.db").strip()
+BOT_STORAGE_ROOT = Path(os.getenv("BOT_STORAGE_ROOT", "./storage")).resolve()
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(50 * 1024 * 1024)))
+SUPERADMIN_IDS = {x.strip() for x in os.getenv("SUPERADMIN_IDS", "").split(",") if x.strip()}
+ADMIN_DEFAULT_PERMISSIONS = {
+    x.strip() for x in os.getenv(
         "ADMIN_DEFAULT_PERMISSIONS",
         "users.view,bots.view,files.view,files.download,logs.view"
-    ).split(",")
-    if x.strip()
+    ).split(",") if x.strip()
 }
-
-SECRET_KEYS = {
-    "password",
-    "passwd",
-    "token",
-    "bot_token",
-    "access_token",
-    "refresh_token",
-    "api_key",
-    "apikey",
-    "session_secret",
-    "private_key",
-    "encryption_key",
-    "runner_private_key",
-    "secret",
-}
-
-
-# ============================================================
-# IN-MEMORY DEMO STORES
-# Replace with existing project's database repositories.
-# ============================================================
-
-USERS: Dict[str, Dict[str, Any]] = {}
-BOTS: Dict[str, Dict[str, Any]] = {}
-AUDIT_LOGS: list[dict[str, Any]] = []
-BROADCASTS: Dict[str, Dict[str, Any]] = {}
-BROADCAST_DELIVERIES: Dict[str, list[dict[str, Any]]] = {}
-ADMIN_PERMISSIONS: Dict[str, set[str]] = {}
-
-BROADCAST_QUEUE: "queue.Queue[str]" = queue.Queue()
-
-
-# ============================================================
-# UTILITY
-# ============================================================
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def json_safe(value: Any) -> Any:
-    """Recursively redact known secret fields."""
-    if isinstance(value, dict):
-        return {
-            k: ("---" if k.lower() in SECRET_KEYS else json_safe(v))
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [json_safe(v) for v in value]
-    return value
-
-
-def get_current_admin() -> Optional[dict[str, Any]]:
-    """
-    Replace this with the existing authenticated-session/identity system.
-
-    SECURITY:
-    Never use a client-supplied role as authorization.
-    """
-    admin_id = request.headers.get("X-Authenticated-User")
-    if not admin_id:
-        return None
-
-    role = "SUPERADMIN" if admin_id in SUPERADMIN_IDS else "ADMIN"
-    permissions = (
-        ALL_PERMISSIONS
-        if role == "SUPERADMIN"
-        else ADMIN_PERMISSIONS.get(admin_id, DEFAULT_ADMIN_PERMISSIONS)
-    )
-
-    return {
-        "id": admin_id,
-        "role": role,
-        "permissions": set(permissions),
-    }
-
-
-def has_permission(admin: dict[str, Any], permission: str) -> bool:
-    return (
-        admin["role"] == "SUPERADMIN"
-        or permission in admin["permissions"]
-    )
-
-
-def audit(
-    admin_id: str,
-    action: str,
-    *,
-    target_user_id: Optional[str] = None,
-    bot_id: Optional[str] = None,
-    file_path: Optional[str] = None,
-    success: bool = True,
-    metadata: Optional[dict[str, Any]] = None,
-) -> None:
-    # Never store file contents or secret values.
-    AUDIT_LOGS.append(
-        {
-            "id": str(uuid.uuid4()),
-            "adminId": admin_id,
-            "action": action,
-            "targetUserId": target_user_id,
-            "botId": bot_id,
-            "filePath": file_path,
-            "timestamp": utc_now(),
-            "success": bool(success),
-            "metadata": json_safe(metadata or {}),
-        }
-    )
-
-
-def require_permission(permission: str):
-    def decorator(fn):
-        @wraps(fn)
-        def wrapped(*args, **kwargs):
-            admin = get_current_admin()
-
-            if not admin:
-                return jsonify({"error": "Permission denied"}), 403
-
-            if not has_permission(admin, permission):
-                audit(
-                    admin["id"],
-                    "PERMISSION_DENIED",
-                    success=False,
-                    metadata={"requiredPermission": permission},
-                )
-                return jsonify({"error": "Permission denied"}), 403
-
-            request.admin = admin
-            return fn(*args, **kwargs)
-
-        return wrapped
-
-    return decorator
-
-
-# ============================================================
-# OWNERSHIP / PATH SECURITY
-# ============================================================
-
-SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-
-
-def validate_id(value: str) -> bool:
-    return bool(value and SAFE_ID.fullmatch(value))
-
-
-def bot_record(user_id: str, bot_id: str) -> Optional[dict[str, Any]]:
-    if not validate_id(user_id) or not validate_id(bot_id):
-        return None
-
-    bot = BOTS.get(bot_id)
-
-    if not bot:
-        return None
-
-    if str(bot.get("userId")) != str(user_id):
-        return None
-
-    return bot
-
-
-def bot_root(user_id: str, bot_id: str) -> Path:
-    """
-    Resolve only the selected user's selected bot directory.
-    Never accepts an arbitrary filesystem path from the client.
-    """
-    if not validate_id(user_id) or not validate_id(bot_id):
-        raise ValueError("Invalid identifier")
-
-    root = (BOT_STORAGE_ROOT / user_id / bot_id).resolve()
-
-    try:
-        root.relative_to(BOT_STORAGE_ROOT)
-    except ValueError:
-        raise ValueError("Storage escape detected")
-
-    return root
-
-
-def safe_bot_path(
-    user_id: str,
-    bot_id: str,
-    relative_path: str,
-) -> tuple[Path, Path]:
-    if not isinstance(relative_path, str):
-        raise ValueError("Invalid path")
-
-    if not relative_path:
-        relative_path = "."
-
-    if "\x00" in relative_path:
-        raise ValueError("Invalid path")
-
-    # Normalize separators and reject traversal.
-    normalized = relative_path.replace("\\", "/")
-
-    if normalized.startswith("/"):
-        raise ValueError("Absolute paths are forbidden")
-
-    parts = [p for p in normalized.split("/") if p not in ("", ".")]
-
-    if ".." in parts:
-        raise ValueError("Path traversal detected")
-
-    root = bot_root(user_id, bot_id)
-    target = (root / Path(*parts)).resolve()
-
-    try:
-        target.relative_to(root)
-    except ValueError:
-        raise ValueError("Storage escape detected")
-
-    # Symlink escape protection.
-    if target.exists():
-        real_target = target.resolve()
-        try:
-            real_target.relative_to(root)
-        except ValueError:
-            raise ValueError("Symlink escape detected")
-
-    return root, target
-
-
-# ============================================================
-# RATE LIMITER
-# ============================================================
-
-class SimpleRateLimiter:
-    def __init__(self, limit: int = 30, window: int = 60):
-        self.limit = limit
-        self.window = window
-        self.events: dict[str, list[float]] = {}
-        self.lock = threading.Lock()
-
-    def allow(self, key: str) -> bool:
-        now = time.time()
-
-        with self.lock:
-            values = self.events.setdefault(key, [])
-            values[:] = [
-                timestamp
-                for timestamp in values
-                if now - timestamp < self.window
-            ]
-
-            if len(values) >= self.limit:
-                return False
-
-            values.append(now)
-            return True
-
-
-ADMIN_RATE_LIMITER = SimpleRateLimiter(60, 60)
-
-
-@app.before_request
-def admin_rate_limit():
-    if request.path.startswith("/api/admin"):
-        admin = get_current_admin()
-        if admin and not ADMIN_RATE_LIMITER.allow(admin["id"]):
-            return jsonify({"error": "Rate limit exceeded"}), 429
-
-
-# ============================================================
-# SESSION / ADMIN INFO
-# ============================================================
-
-@app.get("/api/admin/session")
-@require_permission("users.view")
-def admin_session():
-    admin = request.admin
-    return jsonify(
-        {
-            "user": {"id": admin["id"]},
-            "role": admin["role"],
-            "permissions": sorted(admin["permissions"]),
-        }
-    )
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-@app.get("/api/admin/stats")
-@require_permission("users.view")
-def admin_stats():
-    running = sum(
-        1 for bot in BOTS.values()
-        if str(bot.get("status", "")).upper() == "RUNNING"
-    )
-
-    return jsonify(
-        {
-            "totalUsers": len(USERS),
-            "activeUsers": sum(
-                1 for u in USERS.values()
-                if str(u.get("status", "")).upper() == "ACTIVE"
-            ),
-            "totalBots": len(BOTS),
-            "runningBots": running,
-            "failedDeployments": 0,
-            "onlineRunners": 0,
-            "storageUsage": "0 B",
-            "broadcastsSent": sum(
-                b.get("successCount", 0)
-                for b in BROADCASTS.values()
-            ),
-        }
-    )
-
-
-# ============================================================
-# USERS
-# ============================================================
-
-@app.get("/api/admin/users")
-@require_permission("users.view")
-def list_users():
-    search = request.args.get("search", "").lower()
-    page = max(1, int(request.args.get("page", "1")))
-    limit = min(100, max(1, int(request.args.get("limit", "20"))))
-
-    rows = list(USERS.values())
-
-    if search:
-        rows = [
-            u for u in rows
-            if search in str(u.get("username", "")).lower()
-            or search in str(u.get("email", "")).lower()
-            or search in str(u.get("id", "")).lower()
-        ]
-
-    start = (page - 1) * limit
-    return jsonify(
-        {
-            "items": rows[start:start + limit],
-            "page": page,
-            "limit": limit,
-            "total": len(rows),
-        }
-    )
-
-
-@app.get("/api/admin/users/<user_id>")
-@require_permission("users.view")
-def get_user(user_id: str):
-    user = USERS.get(user_id)
-
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    audit(request.admin["id"], "USER_VIEW", target_user_id=user_id)
-
-    return jsonify(
-        {
-            k: v
-            for k, v in user.items()
-            if k.lower() not in SECRET_KEYS
-        }
-    )
-
-
-@app.get("/api/admin/users/<user_id>/bots")
-@require_permission("bots.view")
-def get_user_bots(user_id: str):
-    if user_id not in USERS:
-        return jsonify({"error": "User not found"}), 404
-
-    rows = [
-        bot
-        for bot in BOTS.values()
-        if str(bot.get("userId")) == str(user_id)
-    ]
-
-    return jsonify({"items": rows})
-
-
-# ============================================================
-# BOT MANAGEMENT
-# ============================================================
-
-@app.get("/api/admin/bots")
-@require_permission("bots.view")
-def list_bots():
-    return jsonify({"items": list(BOTS.values())})
-
-
-@app.get("/api/admin/users/<user_id>/bots/<bot_id>")
-@require_permission("bots.view")
-def get_bot(user_id: str, bot_id: str):
-    bot = bot_record(user_id, bot_id)
-
-    if not bot:
-        return jsonify({"error": "Bot not found"}), 404
-
-    audit(
-        request.admin["id"],
-        "BOT_VIEW",
-        target_user_id=user_id,
-        bot_id=bot_id,
-    )
-
-    return jsonify(json_safe(bot))
-
-
-def perform_bot_action(user_id: str, bot_id: str, action: str):
-    bot = bot_record(user_id, bot_id)
-
-    if not bot:
-        return jsonify({"error": "Bot not found"}), 404
-
-    # Connect these operations to the existing runner/deployment service.
-    if action == "start":
-        bot["status"] = "RUNNING"
-    elif action == "stop":
-        bot["status"] = "STOPPED"
-    elif action == "restart":
-        bot["status"] = "RUNNING"
-    elif action == "redeploy":
-        bot["deploymentStatus"] = "QUEUED"
-
-    audit(
-        request.admin["id"],
-        f"BOT_{action.upper()}",
-        target_user_id=user_id,
-        bot_id=bot_id,
-    )
-
-    return jsonify({"ok": True, "action": action, "bot": json_safe(bot)})
-
-
-@app.post("/api/admin/users/<user_id>/bots/<bot_id>/start")
-@require_permission("bots.manage")
-def start_bot(user_id, bot_id):
-    return perform_bot_action(user_id, bot_id, "start")
-
-
-@app.post("/api/admin/users/<user_id>/bots/<bot_id>/stop")
-@require_permission("bots.manage")
-def stop_bot(user_id, bot_id):
-    return perform_bot_action(user_id, bot_id, "stop")
-
-
-@app.post("/api/admin/users/<user_id>/bots/<bot_id>/restart")
-@require_permission("bots.manage")
-def restart_bot(user_id, bot_id):
-    return perform_bot_action(user_id, bot_id, "restart")
-
-
-@app.post("/api/admin/users/<user_id>/bots/<bot_id>/redeploy")
-@require_permission("bots.manage")
-def redeploy_bot(user_id, bot_id):
-    return perform_bot_action(user_id, bot_id, "redeploy")
-
-
-# ============================================================
-# FILE MANAGER
-# ============================================================
-
-@app.get("/api/admin/users/<user_id>/bots/<bot_id>/files")
-@require_permission("files.view")
-def list_files(user_id: str, bot_id: str):
-    path = request.args.get("path", "")
-
-    try:
-        root, target = safe_bot_path(user_id, bot_id, path)
-
-        if not target.exists():
-            return jsonify({"error": "Path not found"}), 404
-
-        if not target.is_dir():
-            return jsonify({"error": "Not a directory"}), 400
-
-        items = []
-
-        for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-            try:
-                relative = item.relative_to(root).as_posix()
-                stat = item.stat()
-
-                items.append(
-                    {
-                        "name": item.name,
-                        "type": "folder" if item.is_dir() else "file",
-                        "isDirectory": item.is_dir(),
-                        "size": stat.st_size if item.is_file() else None,
-                        "modified": datetime.fromtimestamp(
-                            stat.st_mtime,
-                            timezone.utc,
-                        ).isoformat(),
-                        "path": relative,
-                    }
-                )
-            except (OSError, ValueError):
-                continue
-
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_VIEW",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-        )
-
-        return jsonify({"items": items})
-
-    except ValueError as exc:
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_VIEW",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-            success=False,
-        )
-        return jsonify({"error": str(exc)}), 400
-
-
-@app.get("/api/admin/users/<user_id>/bots/<bot_id>/files/content")
-@require_permission("files.view")
-def read_file(user_id: str, bot_id: str):
-    path = request.args.get("path", "")
-
-    try:
-        root, target = safe_bot_path(user_id, bot_id, path)
-
-        if not target.exists() or not target.is_file():
-            return jsonify({"error": "File not found"}), 404
-
-        if target.stat().st_size > MAX_FILE_SIZE:
-            return jsonify({"error": "File too large"}), 413
-
-        raw = target.read_bytes()
-
-        # Do not expose likely binary files through the text API.
-        if b"\x00" in raw:
-            return jsonify({"error": "Binary file"}), 415
-
-        content = raw.decode("utf-8", errors="replace")
-
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_VIEW",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-        )
-
-        return jsonify({"content": content})
-
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-
-@app.get("/api/admin/users/<user_id>/bots/<bot_id>/files/download")
-@require_permission("files.download")
-def download_file(user_id: str, bot_id: str):
-    path = request.args.get("path", "")
-
-    try:
-        _, target = safe_bot_path(user_id, bot_id, path)
-
-        if not target.exists() or not target.is_file():
-            return jsonify({"error": "File not found"}), 404
-
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_DOWNLOAD",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-        )
-
-        return send_file(target, as_attachment=True)
-
-    except ValueError as exc:
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_DOWNLOAD",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-            success=False,
-        )
-        return jsonify({"error": str(exc)}), 400
-
-
-@app.post("/api/admin/users/<user_id>/bots/<bot_id>/files")
-@require_permission("files.modify")
-def modify_file(user_id: str, bot_id: str):
-    data = request.get_json(silent=True) or {}
-    operation = data.get("operation")
-    path = data.get("path", "")
-
-    try:
-        root, target = safe_bot_path(user_id, bot_id, path)
-
-        if operation == "create":
-            if target.exists():
-                return jsonify({"error": "Already exists"}), 409
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.touch()
-            action = "ADMIN_FILE_EDIT"
-
-        elif operation == "mkdir":
-            if target.exists():
-                return jsonify({"error": "Already exists"}), 409
-            target.mkdir(parents=True)
-            action = "ADMIN_FILE_EDIT"
-
-        elif operation in {"write", "upload"}:
-            content = data.get("content", "")
-
-            if not isinstance(content, str):
-                return jsonify({"error": "Invalid content"}), 400
-
-            raw = content.encode("utf-8")
-
-            if len(raw) > MAX_FILE_SIZE:
-                return jsonify({"error": "File too large"}), 413
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(raw)
-            action = (
-                "ADMIN_FILE_UPLOAD"
-                if operation == "upload"
-                else "ADMIN_FILE_EDIT"
-            )
-
-        elif operation == "rename":
-            new_name = data.get("newName", "")
-
-            if (
-                not new_name
-                or "/" in new_name
-                or "\\" in new_name
-                or new_name in {".", ".."}
-            ):
-                return jsonify({"error": "Invalid name"}), 400
-
-            if not target.exists():
-                return jsonify({"error": "File not found"}), 404
-
-            new_target = (target.parent / new_name).resolve()
-
-            try:
-                new_target.relative_to(root)
-            except ValueError:
-                return jsonify({"error": "Storage escape detected"}), 400
-
-            target.rename(new_target)
-            action = "ADMIN_FILE_RENAME"
-
-        else:
-            return jsonify({"error": "Unsupported operation"}), 400
-
-        audit(
-            request.admin["id"],
-            action,
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-        )
-
-        return jsonify({"ok": True})
-
-    except ValueError as exc:
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_EDIT",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-            success=False,
-        )
-        return jsonify({"error": str(exc)}), 400
-
-
-@app.delete("/api/admin/users/<user_id>/bots/<bot_id>/files")
-@require_permission("files.delete")
-def delete_file(user_id: str, bot_id: str):
-    data = request.get_json(silent=True) or {}
-    path = data.get("path", "")
-
-    try:
-        root, target = safe_bot_path(user_id, bot_id, path)
-
-        if target == root:
-            return jsonify({"error": "Cannot delete bot root"}), 400
-
-        if not target.exists():
-            return jsonify({"error": "Not found"}), 404
-
-        if target.is_dir():
-            import shutil
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_DELETE",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-        )
-
-        return jsonify({"ok": True})
-
-    except ValueError as exc:
-        audit(
-            request.admin["id"],
-            "ADMIN_FILE_DELETE",
-            target_user_id=user_id,
-            bot_id=bot_id,
-            file_path=path,
-            success=False,
-        )
-        return jsonify({"error": str(exc)}), 400
-
-
-# ============================================================
-# USER STATUS
-# ============================================================
-
-@app.post("/api/admin/users/<user_id>/suspend")
-@require_permission("users.manage")
-def suspend_user(user_id: str):
-    user = USERS.get(user_id)
-
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    user["status"] = "SUSPENDED"
-
-    audit(
-        request.admin["id"],
-        "USER_SUSPEND",
-        target_user_id=user_id,
-    )
-
-    return jsonify({"ok": True})
-
-
-@app.post("/api/admin/users/<user_id>/unsuspend")
-@require_permission("users.manage")
-def unsuspend_user(user_id: str):
-    user = USERS.get(user_id)
-
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-
-    user["status"] = "ACTIVE"
-
-    audit(
-        request.admin["id"],
-        "USER_UNSUSPEND",
-        target_user_id=user_id,
-    )
-
-    return jsonify({"ok": True})
-
-
-# ============================================================
-# BROADCAST PROVIDER
-# ============================================================
-
-class BroadcastProvider:
-    """
-    Provider abstraction.
-
-    Replace this implementation with the platform's configured
-    notification provider. Provider-specific authentication and
-    limits must remain server-side.
-    """
-
-    name = "platform"
-
-    def send(self, recipient: dict[str, Any], broadcast: dict[str, Any]) -> dict[str, Any]:
-        # Connect to the existing notification/channel provider here.
-        return {
-            "success": True,
-            "provider": self.name,
-            "recipientId": recipient["id"],
-        }
-
-
-PROVIDER = BroadcastProvider()
-
-
-# ============================================================
-# BROADCAST QUEUE
-# ============================================================
-
-def eligible_recipients(audience_type: str) -> list[dict[str, Any]]:
-    users = list(USERS.values())
-
-    if audience_type == "ALL_USERS":
-        return users
-
-    if audience_type == "ACTIVE_USERS":
-        return [
-            u for u in users
-            if str(u.get("status", "")).upper() == "ACTIVE"
-        ]
-
-    if audience_type == "SUSPENDED_USERS":
-        return [
-            u for u in users
-            if str(u.get("status", "")).upper() == "SUSPENDED"
-        ]
-
-    if audience_type == "USERS_WITH_BOTS":
-        ids = {str(b.get("userId")) for b in BOTS.values()}
-        return [u for u in users if str(u.get("id")) in ids]
-
-    if audience_type == "USERS_WITH_RUNNING_BOTS":
-        ids = {
-            str(b.get("userId"))
-            for b in BOTS.values()
-            if str(b.get("status", "")).upper() == "RUNNING"
-        }
-        return [u for u in users if str(u.get("id")) in ids]
-
-    return []
-
-
-def process_broadcast(broadcast_id: str) -> None:
-    broadcast = BROADCASTS.get(broadcast_id)
-
-    if not broadcast:
-        return
-
-    if broadcast["status"] == "CANCELLED":
-        return
-
-    broadcast["status"] = "PROCESSING"
-    broadcast["startedAt"] = utc_now()
-
-    recipients = eligible_recipients(broadcast["audienceType"])
-
-    deliveries = BROADCAST_DELIVERIES.setdefault(
-        broadcast_id, []
-    )
-
-    for index in range(0, len(recipients), BROADCAST_BATCH_SIZE):
-        batch = recipients[index:index + BROADCAST_BATCH_SIZE]
-
-        for recipient in batch:
-            if broadcast["status"] == "CANCELLED":
-                return
-
-            success = False
-            last_error = None
-
-            for attempt in range(BROADCAST_MAX_RETRIES):
-                try:
-                    result = PROVIDER.send(recipient, broadcast)
-                    success = bool(result.get("success"))
-                    if success:
-                        break
-                except Exception as exc:
-                    last_error = str(exc)
-
-                time.sleep(
-                    BROADCAST_BACKOFF_BASE * (2 ** attempt)
-                )
-
-            deliveries.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "broadcastId": broadcast_id,
-                    "recipientId": recipient.get("id"),
-                    "success": success,
-                    "attempts": attempt + 1,
-                    "error": last_error,
-                    "sentAt": utc_now() if success else None,
-                }
-            )
-
-            if success:
-                broadcast["successCount"] += 1
-            else:
-                broadcast["failureCount"] += 1
-
-    if broadcast["status"] != "CANCELLED":
-        if broadcast["failureCount"] == 0:
-            broadcast["status"] = "COMPLETED"
-        elif broadcast["successCount"] > 0:
-            broadcast["status"] = "PARTIAL"
-        else:
-            broadcast["status"] = "FAILED"
-
-        broadcast["completedAt"] = utc_now()
-
-
-def broadcast_worker() -> None:
-    while True:
-        try:
-            broadcast_id = BROADCAST_QUEUE.get()
-            process_broadcast(broadcast_id)
-        except Exception:
-            pass
-        finally:
-            BROADCAST_QUEUE.task_done()
-
-
-threading.Thread(
-    target=broadcast_worker,
-    daemon=True,
-    name="uzl-broadcast-worker",
-).start()
-
-
-# ============================================================
-# BROADCAST API
-# ============================================================
-
-@app.get("/api/admin/broadcasts/recipient-count")
-@require_permission("broadcast.send")
-def recipient_count():
-    audience = request.args.get("audience", "ALL_USERS")
-    return jsonify({"count": len(eligible_recipients(audience))})
-
-
-@app.post("/api/admin/broadcasts")
-@require_permission("broadcast.send")
-def create_broadcast():
-    data = request.get_json(silent=True) or {}
-
-    title = str(data.get("title", "")).strip()
-    message = str(data.get("message", "")).strip()
-    audience = str(data.get("audienceType", "")).strip()
-
-    allowed_audiences = {
-        "ALL_USERS",
-        "ACTIVE_USERS",
-        "SUSPENDED_USERS",
-        "USERS_WITH_BOTS",
-        "USERS_WITH_RUNNING_BOTS",
-        "CUSTOM",
-    }
-
-    if not title or not message:
-        return jsonify({"error": "Title and message are required"}), 400
-
-    if audience not in allowed_audiences:
-        return jsonify({"error": "Invalid audience"}), 400
-
-    if len(title) > 150 or len(message) > 10000:
-        return jsonify({"error": "Message too long"}), 400
-
-    broadcast_id = str(uuid.uuid4())
-
-    recipients = (
-        eligible_recipients(audience)
-        if audience != "CUSTOM"
-        else []
-    )
-
-    broadcast = {
-        "id": broadcast_id,
-        "createdBy": request.admin["id"],
-        "title": title,
-        "message": message,
-        "audienceType": audience,
-        "status": "QUEUED",
-        "createdAt": utc_now(),
-        "startedAt": None,
-        "completedAt": None,
-        "recipientCount": len(recipients),
-        "successCount": 0,
-        "failureCount": 0,
-        "actionButton": data.get("actionButton"),
-        "media": data.get("media"),
-    }
-
-    BROADCASTS[broadcast_id] = broadcast
-    BROADCAST_DELIVERIES[broadcast_id] = []
-
-    audit(
-        request.admin["id"],
-        "BROADCAST_CREATE",
-        metadata={
-            "broadcastId": broadcast_id,
-            "audience": audience,
-            "recipientCount": len(recipients),
-        },
-    )
-
-    BROADCAST_QUEUE.put(broadcast_id)
-
-    audit(
-        request.admin["id"],
-        "BROADCAST_SEND",
-        metadata={"broadcastId": broadcast_id},
-    )
-
-    return jsonify(broadcast), 202
-
-
-@app.get("/api/admin/broadcasts")
-@require_permission("broadcast.send")
-def list_broadcasts():
-    page = max(1, int(request.args.get("page", "1")))
-    limit = min(100, max(1, int(request.args.get("limit", "20"))))
-
-    rows = sorted(
-        BROADCASTS.values(),
-        key=lambda x: x["createdAt"],
-        reverse=True,
-    )
-
-    start = (page - 1) * limit
-
-    return jsonify(
-        {
-            "items": rows[start:start + limit],
-            "page": page,
-            "limit": limit,
-            "total": len(rows),
-        }
-    )
-
-
-@app.get("/api/admin/broadcasts/<broadcast_id>")
-@require_permission("broadcast.send")
-def get_broadcast(broadcast_id: str):
-    broadcast = BROADCASTS.get(broadcast_id)
-
-    if not broadcast:
-        return jsonify({"error": "Broadcast not found"}), 404
-
-    return jsonify(
-        {
-            **broadcast,
-            "deliveries": BROADCAST_DELIVERIES.get(
-                broadcast_id, []
-            ),
-        }
-    )
-
-
-@app.post("/api/admin/broadcasts/<broadcast_id>/cancel")
-@require_permission("broadcast.send")
-def cancel_broadcast(broadcast_id: str):
-    broadcast = BROADCASTS.get(broadcast_id)
-
-    if not broadcast:
-        return jsonify({"error": "Broadcast not found"}), 404
-
-    if broadcast["status"] in {
-        "COMPLETED",
-        "FAILED",
-        "PARTIAL",
-        "CANCELLED",
-    }:
-        return jsonify({"error": "Broadcast cannot be cancelled"}), 409
-
-    broadcast["status"] = "CANCELLED"
-    broadcast["completedAt"] = utc_now()
-
-    audit(
-        request.admin["id"],
-        "BROADCAST_CANCEL",
-        metadata={"broadcastId": broadcast_id},
-    )
-
-    return jsonify({"ok": True, "status": "CANCELLED"})
-
-
-# ============================================================
-# AUDIT API
-# ============================================================
-
-@app.get("/api/admin/audit")
-@require_permission("logs.view")
-def list_audit():
-    search = request.args.get("search", "").lower()
-    page = max(1, int(request.args.get("page", "1")))
-    limit = min(100, max(1, int(request.args.get("limit", "20"))))
-
-    rows = AUDIT_LOGS
-
-    if search:
-        rows = [
-            row for row in rows
-            if search in json.dumps(
-                row,
-                default=str,
-            ).lower()
-        ]
-
-    rows = list(reversed(rows))
-    start = (page - 1) * limit
-
-    return jsonify(
-        {
-            "items": rows[start:start + limit],
-            "page": page,
-            "limit": limit,
-            "total": len(rows),
-        }
-    )
-
-
-# ============================================================
-# ADMIN PERMISSIONS
-# ============================================================
-
-@app.post("/api/admin/settings/permissions")
-@require_permission("settings.manage")
-def update_permissions():
-    data = request.get_json(silent=True) or {}
-    permissions = set(data.get("permissions", []))
-
-    if not permissions.issubset(ALL_PERMISSIONS):
-        return jsonify({"error": "Invalid permission"}), 400
-
-    # In production this should target a selected admin/role,
-    # not blindly modify the caller's permissions.
-    target_admin_id = data.get("adminId") or request.admin["id"]
-
-    ADMIN_PERMISSIONS[target_admin_id] = permissions
-
-    audit(
-        request.admin["id"],
-        "ADMIN_PERMISSION_UPDATE",
-        metadata={
-            "targetAdminId": target_admin_id,
-            "permissionCount": len(permissions),
-        },
-    )
-
-    return jsonify(
-        {
-            "ok": True,
-            "adminId": target_admin_id,
-            "permissions": sorted(permissions),
-        }
-    )
-
-
-# ============================================================
-# SLASH COMMAND ROUTER
-# ============================================================
-
-def health_check_command() -> str:
-    """
-    Return a safe, non-secret health summary for the bot.
-
-    Intended slash-command behavior:
-        /health
-
-    This does not expose BOT_TOKEN or any other secret.
-    """
-    checks = {
-        "application": "OK",
-        "configuration": "OK" if BOT_TOKEN else "MISSING BOT_TOKEN",
-        "storage": "OK",
-    }
-
-    try:
-        BOT_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
-        storage_ok = BOT_STORAGE_ROOT.is_dir() and os.access(BOT_STORAGE_ROOT, os.R_OK | os.W_OK)
-        checks["storage"] = "OK" if storage_ok else "ERROR"
-    except Exception:
-        checks["storage"] = "ERROR"
-
-    overall = "HEALTHY" if all(value == "OK" for value in checks.values()) else "DEGRADED"
-
-    return (
-        "🩺 UZL BOT HOST HEALTH CHECK\n"
-        f"Overall: {overall}\n"
-        f"Application: {checks['application']}\n"
-        f"Configuration: {checks['configuration']}\n"
-        f"Storage: {checks['storage']}"
-    )
-
-
-def handle_health_command(command: str) -> str | None:
-    """Handle /health while leaving all existing admin command behavior intact."""
-    if command.strip().split()[0].lower() == "/health":
-        return health_check_command()
-    return None
-
-
-def execute_admin_command(admin_id: str, command: str) -> dict[str, Any]:
-    """
-    Framework-independent command parser.
-
-    Connect this function to the existing platform's slash-command
-    handler. The platform identity must be passed from trusted
-    authentication context, not from message text.
-    """
-    admin = {
-        "id": admin_id,
-        "role": (
-            "SUPERADMIN"
-            if admin_id in SUPERADMIN_IDS
-            else "ADMIN"
-        ),
-        "permissions": (
-            ALL_PERMISSIONS
-            if admin_id in SUPERADMIN_IDS
-            else ADMIN_PERMISSIONS.get(
-                admin_id,
-                DEFAULT_ADMIN_PERMISSIONS,
-            )
-        ),
-    }
-
-    command = command.strip()
-    parts = command.split()
-    root = parts[0].lower() if parts else ""
-
-    if root not in {"/admin", "/broadcast"}:
-        return {"ok": False, "message": "Unknown command"}
-
-    if root == "/admin":
-        if len(parts) == 1:
-            return {
-                "ok": True,
-                "menu": [
-                    "users",
-                    "bots",
-                    "stats",
-                    "broadcast",
-                    "runners",
-                    "deployments",
-                    "logs",
-                    "settings",
-                ],
-            }
-
-        section = parts[1].lower()
-
-        permission_map = {
-            "users": "users.view",
-            "bots": "bots.view",
-            "stats": "users.view",
-            "broadcast": "broadcast.send",
-            "runners": "runners.manage",
-            "deployments": "deployments.manage",
-            "logs": "logs.view",
-            "settings": "settings.manage",
-        }
-
-        permission = permission_map.get(section)
-
-        if not permission or not has_permission(admin, permission):
-            audit(
-                admin_id,
-                "COMMAND_PERMISSION_DENIED",
-                success=False,
-                metadata={"command": "/admin " + section},
-            )
-            return {
-                "ok": False,
-                "message": "Permission denied",
-            }
-
-        return {
-            "ok": True,
-            "section": section,
-        }
-
-    if root == "/broadcast":
-        if not has_permission(admin, "broadcast.send"):
-            audit(
-                admin_id,
-                "COMMAND_PERMISSION_DENIED",
-                success=False,
-                metadata={"command": "/broadcast"},
-            )
-            return {
-                "ok": False,
-                "message": "Permission denied",
-            }
-
-        return {
-            "ok": True,
-            "flow": [
-                "AUDIENCE",
-                "MESSAGE",
-                "PREVIEW",
-                "CONFIRM",
-                "QUEUE",
-                "STATUS",
-            ],
-        }
-
-    return {"ok": False, "message": "Permission denied"}
-
-
-# ============================================================
-# TELEGRAM BOT RUNTIME
-# ============================================================
-
-TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-
-
-def telegram_api(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Call Telegram Bot API without exposing the bot token in logs."""
-    token = get_bot_token()
-    data = urlencode(payload or {}).encode("utf-8")
+PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+STARTUP_MESSAGE = os.getenv(
+    "STARTUP_MESSAGE",
+    "🟢 UZL BOT HOST STARTED\n\nStatus: Online\nUse /start to open the premium panel."
+)
+
+BOT_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+
+# ----------------------------- DB -----------------------------
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(255))
+    first_name: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_activity: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class Bot(Base):
+    __tablename__ = "bots"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(32), default="created")
+    entrypoint: Mapped[str | None] = mapped_column(String(255))
+    requirements: Mapped[bool] = mapped_column(Boolean, default=False)
+    pid: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class Audit(Base):
+    __tablename__ = "audit"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    admin_id: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(100))
+    target_user_id: Mapped[str | None] = mapped_column(String(64))
+    bot_id: Mapped[str | None] = mapped_column(String(64))
+    path: Mapped[str | None] = mapped_column(String(1000))
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class Broadcast(Base):
+    __tablename__ = "broadcasts"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_by: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(255))
+    message: Mapped[str] = mapped_column(Text)
+    audience: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="draft")
+    recipient_count: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class CustomButton(Base):
+    __tablename__ = "custom_buttons"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    label: Mapped[str] = mapped_column(String(100))
+    emoji: Mapped[str] = mapped_column(String(20), default="🔘")
+    action: Mapped[str] = mapped_column(String(64))
+    value: Mapped[str | None] = mapped_column(String(1000))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class Setting(Base):
+    __tablename__ = "settings"
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+
+engine_kwargs = {}
+if DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, **engine_kwargs)
+SessionLocal = sessionmaker(engine, expire_on_commit=False)
+Base.metadata.create_all(engine)
+
+# ------------------------ Telegram API ------------------------
+
+def tg(method: str, payload: dict | None = None, timeout: int = 40) -> dict:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not configured")
+    data = urlencode(payload or {}).encode()
     req = Request(
-        TELEGRAM_API.format(token=token, method=method),
+        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
         data=data,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urlopen(req, timeout=max(10, TELEGRAM_POLL_TIMEOUT + 10)) as response:
-        return json.loads(response.read().decode("utf-8"))
+    with urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode())
 
+def send_message(chat_id: str | int, text: str, keyboard=None, parse_mode="HTML"):
+    payload = {"chat_id": str(chat_id), "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if keyboard is not None:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    return tg("sendMessage", payload)
 
-def telegram_send(chat_id: str | int, text: str) -> bool:
+def edit_message(chat_id, message_id, text, keyboard=None):
+    payload = {"chat_id": str(chat_id), "message_id": str(message_id), "text": text, "parse_mode": "HTML"}
+    if keyboard is not None:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    return tg("editMessageText", payload)
+
+def answer_callback(callback_id, text=""):
     try:
-        result = telegram_api("sendMessage", {"chat_id": str(chat_id), "text": text})
-        return bool(result.get("ok"))
+        return tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
     except Exception:
-        return False
+        return {}
 
+# -------------------------- Utilities -------------------------
 
-def _is_authorized_telegram_admin(user_id: int) -> bool:
-    # Telegram user IDs are compared as strings because SUPERADMIN_IDS is env-configured.
-    return str(user_id) in SUPERADMIN_IDS
+def now():
+    return datetime.now(timezone.utc)
 
+def user_id(update):
+    return str(update.get("message", {}).get("from", {}).get("id")
+               or update.get("callback_query", {}).get("from", {}).get("id", ""))
 
-def telegram_help_text() -> str:
+def chat_id(update):
+    return str(update.get("message", {}).get("chat", {}).get("id")
+               or update.get("callback_query", {}).get("message", {}).get("chat", {}).get("id", ""))
+
+def is_superadmin(uid: str) -> bool:
+    return str(uid) in SUPERADMIN_IDS
+
+def require_permission(uid: str, permission: str) -> bool:
+    if is_superadmin(uid):
+        return True
+    # Admin role storage can be extended here; this default is intentionally restrictive.
+    return permission in ADMIN_DEFAULT_PERMISSIONS
+
+def audit(admin_id, action, target_user_id=None, bot_id=None, path=None, success=True):
+    with SessionLocal() as db:
+        db.add(Audit(
+            admin_id=str(admin_id), action=action,
+            target_user_id=str(target_user_id) if target_user_id else None,
+            bot_id=str(bot_id) if bot_id else None,
+            path=path, success=success
+        ))
+        db.commit()
+
+def user_root(uid: str) -> Path:
+    return (BOT_STORAGE_ROOT / "user" / str(uid)).resolve()
+
+def bot_root(uid: str, bid: str) -> Path:
+    root = (user_root(uid) / "bot" / str(bid)).resolve()
+    allowed = user_root(uid).resolve()
+    if allowed not in root.parents:
+        raise PermissionError("storage escape")
+    return root
+
+def safe_relative(base: Path, relative: str) -> Path:
+    if not relative or "\x00" in relative:
+        raise ValueError("invalid path")
+    relative = relative.replace("\\", "/")
+    p = Path(relative)
+    if p.is_absolute() or any(part in ("..", "") for part in p.parts):
+        raise ValueError("invalid path")
+    result = (base / p).resolve()
+    if base.resolve() != result and base.resolve() not in result.parents:
+        raise PermissionError("storage escape")
+    return result
+
+def html(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def keyboard(rows):
+    return rows
+
+# ------------------------- User UI ----------------------------
+
+def main_keyboard():
+    return keyboard([
+        [{"text": "➕ Add Bot", "callback_data": "add_bot"}, {"text": "🤖 My Bots", "callback_data": "my_bots"}],
+        [{"text": "🗑 Remove Bot", "callback_data": "remove_bot"}, {"text": "📁 My Files", "callback_data": "my_files"}],
+        [{"text": "⬆️ Upload ZIP", "callback_data": "upload_zip"}, {"text": "📄 Upload File", "callback_data": "upload_file"}],
+        [{"text": "📊 Bot Status", "callback_data": "bot_status"}, {"text": "📜 History", "callback_data": "history"}],
+        [{"text": "🏓 Ping", "callback_data": "ping"}, {"text": "⚙️ Settings", "callback_data": "settings"}],
+        [{"text": "❓ Help", "callback_data": "help"}],
+    ])
+
+def get_or_create_user(update):
+    uid = user_id(update)
+    sender = update.get("message", {}).get("from") or update.get("callback_query", {}).get("from", {})
+    with SessionLocal() as db:
+        u = db.get(User, uid)
+        if not u:
+            u = User(id=uid, username=sender.get("username"), first_name=sender.get("first_name"))
+            db.add(u)
+        else:
+            u.username = sender.get("username")
+            u.first_name = sender.get("first_name")
+            u.last_activity = now()
+        db.commit()
+    return uid
+
+def start_screen(uid):
+    with SessionLocal() as db:
+        bot_count = db.scalar(select(func.count()).select_from(Bot).where(Bot.user_id == uid)) or 0
+        running = db.scalar(select(func.count()).select_from(Bot).where(Bot.user_id == uid, Bot.status == "running")) or 0
+        custom = db.scalars(select(CustomButton).where(CustomButton.enabled == True).order_by(CustomButton.position)).all()
+        setting = db.get(Setting, "start_message")
+    base = setting.value if setting else (
+        "╭────────────────────╮\n"
+        "   🚀 <b>UZL BOT HOST</b>\n"
+        "   ⚡ Premium Bot Hosting\n"
+        "╰────────────────────╯\n\n"
+        "Welcome to your premium bot hosting dashboard."
+    )
+    text = (
+        f"{base}\n\n"
+        f"👤 User: <code>{html(uid)}</code>\n"
+        f"🤖 Bots: <b>{bot_count}</b>\n"
+        f"🟢 Running: <b>{running}</b>\n"
+        f"📡 Server: <b>Online</b>\n\n"
+        "Choose an action:"
+    )
+    kb = main_keyboard()
+    if custom:
+        for b in custom[:100]:
+            kb.append([{"text": f"{b.emoji} {b.label}", "callback_data": f"custom:{b.id}"}])
+    return text, kb
+
+# -------------------------- Bot hosting -----------------------
+
+def detect_entrypoint(root: Path):
+    for candidate in ("main.py", "bot.py", "app.py", "run.py"):
+        if (root / candidate).is_file():
+            return candidate
+    py_files = list(root.glob("*.py"))
+    return py_files[0].name if py_files else None
+
+def create_bot(uid, name):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,50}", name):
+        raise ValueError("Bot name may contain only letters, numbers, _ and -")
+    bid = uuid.uuid4().hex
+    root = bot_root(uid, bid)
+    root.mkdir(parents=True, exist_ok=False)
+    with SessionLocal() as db:
+        if db.scalar(select(Bot).where(Bot.user_id == uid, Bot.name == name)):
+            shutil.rmtree(root, ignore_errors=True)
+            raise ValueError("A bot with that name already exists")
+        db.add(Bot(id=bid, user_id=uid, name=name))
+        db.commit()
+    return bid
+
+def list_bots(uid):
+    with SessionLocal() as db:
+        return db.scalars(select(Bot).where(Bot.user_id == uid).order_by(Bot.created_at.desc())).all()
+
+_processes: dict[str, subprocess.Popen] = {}
+_process_lock = threading.Lock()
+
+def start_bot(uid, bid):
+    with SessionLocal() as db:
+        b = db.get(Bot, bid)
+        if not b or b.user_id != uid:
+            raise PermissionError("Bot not found")
+        if b.status == "running" and b.pid:
+            return
+        root = bot_root(uid, bid)
+        entry = b.entrypoint or detect_entrypoint(root)
+        if not entry:
+            raise RuntimeError("No Python entrypoint found. Upload a project first.")
+        b.entrypoint = entry
+        b.status = "starting"
+        db.commit()
+    cmd = ["python", entry]
+    log_path = bot_root(uid, bid) / "uzl_runtime.log"
+    log_file = open(log_path, "a", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd, cwd=str(bot_root(uid, bid)), stdout=log_file, stderr=subprocess.STDOUT,
+        start_new_session=True
+    )
+    with _process_lock:
+        _processes[bid] = proc
+    with SessionLocal() as db:
+        b = db.get(Bot, bid)
+        b.pid = proc.pid
+        b.status = "running"
+        b.updated_at = now()
+        db.commit()
+
+def stop_bot(uid, bid):
+    with SessionLocal() as db:
+        b = db.get(Bot, bid)
+        if not b or b.user_id != uid:
+            raise PermissionError("Bot not found")
+        pid = b.pid
+    with _process_lock:
+        proc = _processes.get(bid)
+    if proc and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    elif pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    with _process_lock:
+        _processes.pop(bid, None)
+    with SessionLocal() as db:
+        b = db.get(Bot, bid)
+        if b:
+            b.status, b.pid, b.updated_at = "stopped", None, now()
+            db.commit()
+
+def bot_menu(uid, bid):
+    with SessionLocal() as db:
+        b = db.get(Bot, bid)
+    if not b or b.user_id != uid:
+        return "❌ Bot not found.", main_keyboard()
     return (
-        "🤖 UZL BOT HOST — COMMANDS\n\n"
-        "General:\n"
-        "/start — Start the bot and show the main menu\n"
-        "/help — Show all usable commands\n"
-        "/health — Live application/config/storage health check\n\n"
-        "Admin:\n"
-        "/admin — Open admin command menu\n"
-        "/admin users — User management section\n"
-        "/admin bots — Bot management section\n"
-        "/admin stats — Dashboard statistics\n"
-        "/admin broadcast — Broadcast section\n"
-        "/admin runners — Runner management section\n"
-        "/admin deployments — Deployment management section\n"
-        "/admin logs — Audit/log section\n"
-        "/admin settings — Permission/settings section\n"
-        "/broadcast — Start broadcast flow\n\n"
-        "🔐 Admin commands require your Telegram user ID to be in SUPERADMIN_IDS."
+        f"🤖 <b>{html(b.name)}</b>\n\n"
+        f"Status: <b>{html(b.status.upper())}</b>\n"
+        f"Entrypoint: <code>{html(b.entrypoint or 'not detected')}</code>"
+    ), [
+        [{"text": "▶️ Start", "callback_data": f"start:{bid}"}, {"text": "⏹ Stop", "callback_data": f"stop:{bid}"}],
+        [{"text": "🔄 Restart", "callback_data": f"restart:{bid}"}, {"text": "📋 Logs", "callback_data": f"logs:{bid}"}],
+        [{"text": "📁 Files", "callback_data": f"files:{bid}"}, {"text": "📊 Metrics", "callback_data": f"metrics:{bid}"}],
+        [{"text": "🗑 Remove", "callback_data": f"remove_confirm:{bid}"}],
+        [{"text": "↩️ My Bots", "callback_data": "my_bots"}],
+    ]
+
+# ------------------------- File manager -----------------------
+
+def directory_keyboard(uid, bid, rel=""):
+    root = bot_root(uid, bid)
+    current = safe_relative(root, rel) if rel else root
+    rows = []
+    for p in sorted(current.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:40]:
+        child_rel = str(p.relative_to(root)).replace("\\", "/")
+        icon = "📂" if p.is_dir() else "📄"
+        rows.append([{"text": f"{icon} {p.name}", "callback_data": f"openfile:{bid}:{child_rel}"}])
+    parent = str(Path(rel).parent).replace("\\", "/") if rel else ""
+    if parent == ".":
+        parent = ""
+    rows.append([
+        {"text": "⬆️ Upload", "callback_data": f"uploadfile:{bid}:{rel}"},
+        {"text": "📁 New Folder", "callback_data": f"newfolder:{bid}:{rel}"}
+    ])
+    if rel:
+        rows.append([{"text": "↩️ Back", "callback_data": f"files:{bid}:{parent}"}])
+    rows.append([{"text": "🤖 Bot", "callback_data": f"bot:{bid}"}])
+    return rows
+
+def file_text(uid, bid, rel):
+    root = bot_root(uid, bid)
+    p = safe_relative(root, rel)
+    if p.is_dir():
+        return f"📁 <b>{html(rel or '/')}</b>", directory_keyboard(uid, bid, rel)
+    size = p.stat().st_size
+    if size > 500_000:
+        return f"📄 <b>{html(p.name)}</b>\n\nSize: {size} bytes\nUse Download to retrieve large files.", [
+            [{"text": "⬇️ Download", "callback_data": f"download:{bid}:{rel}"}],
+            [{"text": "↩️ Files", "callback_data": f"files:{bid}:{Path(rel).parent}"}]
+        ]
+    content = p.read_text(encoding="utf-8", errors="replace")
+    if len(content) > 3500:
+        content = content[:3500] + "\n…"
+    return f"📄 <b>{html(p.name)}</b>\n\n<pre>{html(content)}</pre>", [
+        [{"text": "⬇️ Download", "callback_data": f"download:{bid}:{rel}"}],
+        [{"text": "🗑 Delete", "callback_data": f"deletefile:{bid}:{rel}"}],
+        [{"text": "↩️ Files", "callback_data": f"files:{bid}:{Path(rel).parent}"}]
+    ]
+
+# ----------------------- Admin UI -----------------------------
+
+def admin_keyboard():
+    return [
+        [{"text": "📊 Dashboard", "callback_data": "admin:stats"}, {"text": "👥 Users", "callback_data": "admin:users"}],
+        [{"text": "🤖 Bots", "callback_data": "admin:bots"}, {"text": "📁 User Files", "callback_data": "admin:files"}],
+        [{"text": "📡 Runners", "callback_data": "admin:runners"}, {"text": "🚀 Deployments", "callback_data": "admin:deployments"}],
+        [{"text": "📢 Broadcast", "callback_data": "admin:broadcast"}, {"text": "📜 Audit Logs", "callback_data": "admin:logs"}],
+        [{"text": "🎛️ Custom Buttons", "callback_data": "admin:buttons"}, {"text": "✏️ Start Message", "callback_data": "admin:startmsg"}],
+        [{"text": "⚙️ Settings", "callback_data": "admin:settings"}],
+    ]
+
+def admin_stats():
+    with SessionLocal() as db:
+        users = db.scalar(select(func.count()).select_from(User)) or 0
+        bots = db.scalar(select(func.count()).select_from(Bot)) or 0
+        running = db.scalar(select(func.count()).select_from(Bot).where(Bot.status == "running")) or 0
+        failed = db.scalar(select(func.count()).select_from(Bot).where(Bot.status == "failed")) or 0
+        broadcasts = db.scalar(select(func.count()).select_from(Broadcast)) or 0
+    return (
+        "🛡️ <b>UZL ADMIN DASHBOARD</b>\n\n"
+        f"👥 Total Users: <b>{users}</b>\n"
+        f"🤖 Total Bots: <b>{bots}</b>\n"
+        f"🟢 Running Bots: <b>{running}</b>\n"
+        f"🔴 Failed Bots: <b>{failed}</b>\n"
+        f"📢 Broadcasts: <b>{broadcasts}</b>\n"
+        f"📡 Runner: <b>Online</b>"
     )
 
+def admin_users():
+    with SessionLocal() as db:
+        rows = db.scalars(select(User).order_by(User.created_at.desc()).limit(15)).all()
+    if not rows:
+        return "👥 No users yet.", admin_keyboard()
+    text = "👥 <b>Recent Users</b>\n\n"
+    kb = []
+    for u in rows:
+        text += f"• <code>{u.id}</code> @{html(u.username or 'no_username')} — {u.status}\n"
+        kb.append([{"text": f"👤 {u.first_name or u.username or u.id}", "callback_data": f"adminuser:{u.id}"}])
+    kb.append([{"text": "↩️ Admin", "callback_data": "admin:home"}])
+    return text, kb
 
-def telegram_admin_message(user_id: int, command: str) -> str:
-    if not _is_authorized_telegram_admin(user_id):
-        return "⛔ Permission denied."
+def admin_bots():
+    with SessionLocal() as db:
+        rows = db.scalars(select(Bot).order_by(Bot.created_at.desc()).limit(25)).all()
+    text = "🤖 <b>Recent Bots</b>\n\n" + (
+        "\n".join(f"• {html(b.name)} — <b>{b.status}</b> — user <code>{b.user_id}</code>" for b in rows)
+        if rows else "No bots yet."
+    )
+    return text, [[{"text": "↩️ Admin", "callback_data": "admin:home"}]]
 
-    result = execute_admin_command(str(user_id), command)
-    if not result.get("ok"):
-        return f"⛔ {result.get('message', 'Permission denied')}"
+def audit_text():
+    with SessionLocal() as db:
+        rows = db.scalars(select(Audit).order_by(Audit.created_at.desc()).limit(20)).all()
+    text = "📜 <b>Audit Logs</b>\n\n"
+    for a in rows:
+        text += f"• {html(a.action)} | admin <code>{a.admin_id}</code> | {'OK' if a.success else 'FAIL'}\n"
+    return text, [[{"text": "↩️ Admin", "callback_data": "admin:home"}]]
 
-    if command.strip().lower() == "/admin":
-        return (
-            "🛡️ ADMIN PANEL\n\n"
-            "Available sections:\n"
-            "• /admin users\n"
-            "• /admin bots\n"
-            "• /admin stats\n"
-            "• /admin broadcast\n"
-            "• /admin runners\n"
-            "• /admin deployments\n"
-            "• /admin logs\n"
-            "• /admin settings\n\n"
-            "Use a section command to open it."
-        )
+# ----------------------- Update router ------------------------
 
-    section = result.get("section")
-    messages = {
-        "users": "👥 USERS\n\nUser management section is available.\nUse the admin web/API interface for view, suspend, unsuspend and delete operations.",
-        "bots": "🤖 BOTS\n\nBot management section is available.\nUse the admin web/API interface for bot start, stop, restart, redeploy, logs and files.",
-        "stats": "📊 STATS\n\nDashboard statistics section is available.\nCurrent in-process users: {users}\nCurrent in-process bots: {bots}\nAudit records: {audit}",
-        "broadcast": "📢 BROADCAST\n\nBroadcast flow:\n1. Audience\n2. Message\n3. Preview\n4. Confirm\n5. Queue\n6. Status\n\nUse /broadcast to open the flow.",
-        "runners": "⚙️ RUNNERS\n\nRunner management section is available.",
-        "deployments": "🚀 DEPLOYMENTS\n\nDeployment management section is available.",
-        "logs": "🧾 LOGS\n\nAudit/log section is available.",
-        "settings": "⚙️ SETTINGS\n\nPermission/settings section is available.",
-    }
-    if section == "stats":
-        return messages[section].format(users=len(USERS), bots=len(BOTS), audit=len(AUDIT_LOGS))
-    return messages.get(section, "✅ Section opened.")
+def callback(update):
+    q = update["callback_query"]
+    uid = str(q["from"]["id"])
+    cid = q["id"]
+    data = q.get("data", "")
+    chat = q["message"]["chat"]["id"]
+    mid = q["message"]["message_id"]
+    answer_callback(cid)
 
+    try:
+        if data == "add_bot":
+            with SessionLocal() as db:
+                db.add(Setting(key=f"state:{uid}", value="await_bot_name"))
+                db.commit()
+            edit_message(chat, mid, "➕ <b>Add Bot</b>\n\nSend the bot name now.\n\nAllowed: letters, numbers, _ and -", [[{"text":"❌ Cancel","callback_data":"cancel"}]])
+            return
 
-def telegram_process_update(update: dict[str, Any]) -> None:
-    message = update.get("message") or update.get("edited_message")
-    if not message or not message.get("text"):
+        if data == "my_bots":
+            bots = list_bots(uid)
+            text = "🤖 <b>MY BOTS</b>\n\n"
+            kb = []
+            if not bots:
+                text += "No bots yet. Tap ➕ Add Bot."
+            for b in bots:
+                text += f"• <b>{html(b.name)}</b> — {b.status.upper()}\n"
+                kb.append([{"text": f"🤖 {b.name} • {b.status}", "callback_data": f"bot:{b.id}"}])
+            kb.append([{"text":"↩️ Home","callback_data":"home"}])
+            edit_message(chat, mid, text, kb)
+            return
+
+        if data.startswith("bot:"):
+            text, kb = bot_menu(uid, data.split(":",1)[1])
+            edit_message(chat, mid, text, kb)
+            return
+
+        if data.startswith("start:"):
+            bid = data.split(":",1)[1]
+            edit_message(chat, mid, "⏳ Starting...\n⚙️ Preparing...\n🚀 Launching...")
+            start_bot(uid, bid)
+            edit_message(chat, mid, "🟢 <b>Bot is running.</b>", bot_menu(uid, bid)[1])
+            return
+
+        if data.startswith("stop:"):
+            bid = data.split(":",1)[1]
+            edit_message(chat, mid, "⏳ Stopping...")
+            stop_bot(uid, bid)
+            edit_message(chat, mid, "🔴 <b>Bot stopped.</b>", bot_menu(uid, bid)[1])
+            return
+
+        if data.startswith("restart:"):
+            bid = data.split(":",1)[1]
+            edit_message(chat, mid, "🔄 Restarting...")
+            stop_bot(uid, bid)
+            start_bot(uid, bid)
+            edit_message(chat, mid, "🟢 <b>Bot restarted.</b>", bot_menu(uid, bid)[1])
+            return
+
+        if data.startswith("logs:"):
+            bid = data.split(":",1)[1]
+            p = bot_root(uid, bid) / "uzl_runtime.log"
+            content = p.read_text(encoding="utf-8", errors="replace")[-3500:] if p.exists() else "No logs yet."
+            edit_message(chat, mid, f"📋 <b>Logs</b>\n\n<pre>{html(content)}</pre>", [[{"text":"↩️ Bot","callback_data":f"bot:{bid}"}]])
+            return
+
+        if data.startswith("files:"):
+            parts = data.split(":", 2)
+            bid = parts[1]
+            rel = parts[2] if len(parts) > 2 else ""
+            text, kb = file_text(uid, bid, rel)
+            edit_message(chat, mid, text, kb)
+            return
+
+        if data.startswith("openfile:"):
+            _, bid, rel = data.split(":", 2)
+            text, kb = file_text(uid, bid, rel)
+            edit_message(chat, mid, text, kb)
+            return
+
+        if data.startswith("remove_confirm:"):
+            bid = data.split(":",1)[1]
+            edit_message(chat, mid, "⚠️ <b>Remove this bot permanently?</b>\nFiles, logs and deployment data will be deleted.", [
+                [{"text":"🗑 YES, REMOVE","callback_data":f"remove:{bid}"},{"text":"❌ Cancel","callback_data":f"bot:{bid}"}]
+            ])
+            return
+
+        if data.startswith("remove:"):
+            bid = data.split(":",1)[1]
+            with SessionLocal() as db:
+                b = db.get(Bot, bid)
+                if not b or b.user_id != uid:
+                    raise PermissionError("Bot not found")
+                stop_bot(uid, bid)
+                shutil.rmtree(bot_root(uid, bid), ignore_errors=True)
+                db.delete(b)
+                db.commit()
+            edit_message(chat, mid, "✅ <b>Bot removed.</b>", main_keyboard())
+            return
+
+        if data in ("home", "cancel"):
+            text, kb = start_screen(uid)
+            edit_message(chat, mid, text, kb)
+            return
+
+        if data == "ping":
+            start = time.perf_counter()
+            with SessionLocal() as db:
+                db.execute(select(User).limit(1))
+            ms = round((time.perf_counter() - start) * 1000)
+            edit_message(chat, mid, f"🏓 <b>PONG</b>\n\nServer: 🟢 Online\nDatabase: 🟢 Connected\nLatency: <b>{ms} ms</b>", [[{"text":"↩️ Home","callback_data":"home"}]])
+            return
+
+        if data == "help":
+            edit_message(chat, mid, "❓ <b>HELP</b>\n\nCreate a bot, upload a ZIP/project, inspect files, deploy and control it from the buttons.", [[{"text":"↩️ Home","callback_data":"home"}]])
+            return
+
+        if data == "settings":
+            edit_message(chat, mid, "⚙️ <b>Settings</b>\n\n🔔 Notifications\n🎨 UI Preferences\n🔊 Alerts\n📊 Usage\n🔐 Security\n🌐 Language", [[{"text":"↩️ Home","callback_data":"home"}]])
+            return
+
+        if data.startswith("admin:"):
+            if not is_superadmin(uid):
+                edit_message(chat, mid, "Permission denied.")
+                return
+            action = data.split(":",1)[1]
+            if action == "home":
+                edit_message(chat, mid, "🛡️ <b>UZL ADMIN CENTER</b>\n\nChoose a section:", admin_keyboard())
+            elif action == "stats":
+                edit_message(chat, mid, admin_stats(), admin_keyboard())
+            elif action == "users":
+                text, kb = admin_users(); edit_message(chat, mid, text, kb)
+            elif action == "bots":
+                text, kb = admin_bots(); edit_message(chat, mid, text, kb)
+            elif action == "logs":
+                text, kb = audit_text(); edit_message(chat, mid, text, kb)
+            elif action == "broadcast":
+                edit_message(chat, mid, "📢 <b>Broadcast</b>\n\nUse /broadcast TITLE | MESSAGE", [[{"text":"↩️ Admin","callback_data":"admin:home"}]])
+            elif action == "buttons":
+                edit_message(chat, mid, "🎛️ <b>Custom Buttons</b>\n\nUse /admin_button Label | action | value\nMaximum: 100 enabled buttons.", [[{"text":"↩️ Admin","callback_data":"admin:home"}]])
+            elif action == "startmsg":
+                edit_message(chat, mid, "✏️ <b>Start Message</b>\n\nUse /admin_startmsg Your custom welcome text", [[{"text":"↩️ Admin","callback_data":"admin:home"}]])
+            else:
+                edit_message(chat, mid, f"⚙️ <b>{html(action.title())}</b>\n\nSection ready.", admin_keyboard())
+            return
+
+        if data.startswith("adminuser:"):
+            if not is_superadmin(uid):
+                edit_message(chat, mid, "Permission denied."); return
+            target = data.split(":",1)[1]
+            with SessionLocal() as db:
+                u = db.get(User, target)
+                count = db.scalar(select(func.count()).select_from(Bot).where(Bot.user_id == target)) or 0
+            if not u:
+                edit_message(chat, mid, "User not found."); return
+            edit_message(chat, mid, f"👤 <b>User</b>\n\nID: <code>{target}</code>\nUsername: @{html(u.username or 'none')}\nStatus: {u.status}\nBots: {count}", [[{"text":"🤖 Bots","callback_data":f"adminuserbots:{target}"},{"text":"📁 Files","callback_data":f"adminuserbots:{target}"}],[{"text":"↩️ Users","callback_data":"admin:users"}]])
+            return
+
+        if data.startswith("adminuserbots:"):
+            if not is_superadmin(uid):
+                edit_message(chat, mid, "Permission denied."); return
+            target = data.split(":",1)[1]
+            with SessionLocal() as db:
+                bots = db.scalars(select(Bot).where(Bot.user_id == target)).all()
+            text = f"🤖 <b>User {html(target)} Bots</b>\n\n" + ("\n".join(f"• {html(b.name)} — {b.status} — <code>{b.id}</code>" for b in bots) or "No bots.")
+            edit_message(chat, mid, text, [[{"text":"↩️ Users","callback_data":"admin:users"}]])
+            return
+
+        if data.startswith("custom:"):
+            bid = data.split(":",1)[1]
+            with SessionLocal() as db:
+                b = db.get(CustomButton, bid)
+            if not b or not b.enabled:
+                edit_message(chat, mid, "❌ Button unavailable.", main_keyboard()); return
+            if b.action == "url" and b.value:
+                edit_message(chat, mid, f"🔗 <b>{html(b.label)}</b>\n\n{html(b.value)}", [[{"text":"↩️ Home","callback_data":"home"}]])
+            elif b.action == "broadcast":
+                edit_message(chat, mid, "📢 Broadcast is an admin function.", main_keyboard())
+            else:
+                edit_message(chat, mid, html(b.value or b.label), [[{"text":"↩️ Home","callback_data":"home"}]])
+            return
+
+    except Exception as exc:
+        edit_message(chat, mid, f"❌ <b>Operation failed</b>\n\n{html(str(exc))}", [[{"text":"↩️ Home","callback_data":"home"}]])
+
+def message(update):
+    msg = update["message"]
+    uid = get_or_create_user(update)
+    chat = msg["chat"]["id"]
+    text = msg.get("text", "").strip()
+
+    if text.startswith("/start"):
+        t, kb = start_screen(uid); send_message(chat, t, kb); return
+
+    if text == "/health":
+        send_message(chat, "🟢 <b>UZL BOT HOST</b>\n\nServer: Online\nDatabase: Connected\nTelegram API: Online")
         return
-    text = str(message["text"]).strip()
-    if not text.startswith("/"):
+
+    if text == "/help":
+        send_message(chat, "❓ <b>Commands</b>\n\n/start — Open panel\n/health — Health\n/admin — Admin panel\n/broadcast — Admin broadcast")
         return
 
-    # Telegram may send /command@botname; normalize it.
-    command = text.split()[0].split("@", 1)[0].lower()
-    args = text.split()[1:]
-    user = message.get("from") or {}
-    user_id = int(user.get("id", 0))
-    chat_id = message.get("chat", {}).get("id")
+    if text == "/admin" or text.startswith("/admin "):
+        if not is_superadmin(uid):
+            send_message(chat, "Permission denied."); return
+        send_message(chat, "🛡️ <b>UZL ADMIN CENTER</b>\n\nChoose a section:", admin_keyboard()); return
 
-    if command == "/start":
-        reply = (
-            "🟢 UZL BOT HOST ONLINE\n\n"
-            "Welcome! Your bot-host control service is running.\n\n"
-            "Use /help for all usable commands.\n"
-            "Use /health for a live health check."
-        )
-    elif command == "/help":
-        reply = telegram_help_text()
-    elif command == "/health":
-        reply = health_check_command()
-    elif command == "/admin":
-        reply = telegram_admin_message(user_id, "/admin" + (" " + " ".join(args) if args else ""))
-    elif command == "/broadcast":
-        reply = telegram_admin_message(user_id, "/broadcast")
-    else:
-        reply = "❓ Unknown command. Use /help to see all usable commands."
+    if text.startswith("/admin_startmsg"):
+        if not is_superadmin(uid): send_message(chat, "Permission denied."); return
+        value = text[len("/admin_startmsg"):].strip()
+        if not value: send_message(chat, "Usage: /admin_startmsg Your welcome text"); return
+        with SessionLocal() as db:
+            s = db.get(Setting, "start_message") or Setting(key="start_message", value=value)
+            s.value = value
+            db.add(s); db.commit()
+        audit(uid, "START_MESSAGE_UPDATE")
+        send_message(chat, "✅ Start message saved."); return
 
-    if chat_id is not None:
-        telegram_send(chat_id, reply)
+    if text.startswith("/admin_button"):
+        if not is_superadmin(uid): send_message(chat, "Permission denied."); return
+        raw = text[len("/admin_button"):].strip()
+        parts = [x.strip() for x in raw.split("|", 2)]
+        if len(parts) < 2:
+            send_message(chat, "Usage: /admin_button Label | action | value"); return
+        with SessionLocal() as db:
+            count = db.scalar(select(func.count()).select_from(CustomButton)) or 0
+            if count >= 100:
+                send_message(chat, "❌ Maximum 100 custom buttons reached."); return
+            b = CustomButton(id=uuid.uuid4().hex, label=parts[0], action=parts[1], value=parts[2] if len(parts) > 2 else None, position=count)
+            db.add(b); db.commit()
+        audit(uid, "CUSTOM_BUTTON_CREATE")
+        send_message(chat, "✅ Custom button created."); return
 
+    if text.startswith("/broadcast"):
+        if not is_superadmin(uid):
+            send_message(chat, "Permission denied."); return
+        raw = text[len("/broadcast"):].strip()
+        parts = [x.strip() for x in raw.split("|", 1)]
+        if len(parts) != 2:
+            send_message(chat, "Usage: /broadcast TITLE | MESSAGE"); return
+        with SessionLocal() as db:
+            b = Broadcast(id=uuid.uuid4().hex, created_by=uid, title=parts[0], message=parts[1], audience="all", status="queued")
+            db.add(b); db.commit()
+        send_message(chat, f"📢 <b>Broadcast queued</b>\n\nTitle: {html(parts[0])}\nAudience: All users")
+        return
 
-def telegram_polling_worker() -> None:
-    offset = 0
-    while True:
+    # State machine: bot name, upload preparation, etc.
+    with SessionLocal() as db:
+        state = db.get(Setting, f"state:{uid}")
+    if state and state.value == "await_bot_name":
         try:
-            result = telegram_api(
-                "getUpdates",
-                {"timeout": str(TELEGRAM_POLL_TIMEOUT), "offset": str(offset), "allowed_updates": json.dumps(["message"])},
-            )
-            if not result.get("ok"):
-                time.sleep(5)
-                continue
-            for update in result.get("result", []):
-                offset = max(offset, int(update.get("update_id", 0)) + 1)
-                telegram_process_update(update)
-        except Exception:
-            time.sleep(5)
-
-
-def start_telegram_runtime() -> None:
-    if not TELEGRAM_POLLING_ENABLED or not BOT_TOKEN:
+            bid = create_bot(uid, text)
+            with SessionLocal() as db:
+                db.delete(db.get(Setting, f"state:{uid}")); db.commit()
+            send_message(chat, f"✅ <b>Bot Created</b>\n\nName: <b>{html(text)}</b>\nID: <code>{bid}</code>", bot_menu(uid, bid)[1])
+        except Exception as exc:
+            send_message(chat, f"❌ {html(str(exc))}")
         return
-    # Avoid starting a second poller if this module is imported more than once.
-    if getattr(start_telegram_runtime, "started", False):
-        return
-    start_telegram_runtime.started = True
-    threading.Thread(target=telegram_polling_worker, daemon=True, name="uzl-telegram-poller").start()
-    if TELEGRAM_ADMIN_CHAT_ID:
-        threading.Thread(
-            target=lambda: telegram_send(TELEGRAM_ADMIN_CHAT_ID, STARTUP_MESSAGE),
-            daemon=True,
-            name="uzl-startup-message",
-        ).start()
 
+    send_message(chat, "Use /start to open the UZL BOT HOST panel.", main_keyboard())
 
-start_telegram_runtime()
+# --------------------------- Webhook ---------------------------
 
-
-# ============================================================
-# EXAMPLE HEALTH CHECK
-# ============================================================
+@app.post("/telegram/webhook")
+def telegram_webhook():
+    if TELEGRAM_WEBHOOK_SECRET:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+            return jsonify({"ok": False}), 403
+    update = request.get_json(silent=True) or {}
+    try:
+        if update.get("callback_query"):
+            callback(update)
+        elif update.get("message"):
+            message(update)
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 @app.get("/health")
 def health():
-    return jsonify(
-        {
-            "ok": True,
-            "service": "UZL BOT HOST",
-            "adminSystem": True,
-            "time": utc_now(),
-        }
-    )
+    db_ok = True
+    try:
+        with SessionLocal() as db:
+            db.execute(select(User).limit(1))
+    except Exception:
+        db_ok = False
+    return jsonify({
+        "ok": db_ok,
+        "service": "UZL BOT HOST",
+        "database": db_ok,
+        "telegram_configured": bool(BOT_TOKEN),
+        "storage": str(BOT_STORAGE_ROOT),
+    })
 
+@app.get("/")
+def index():
+    return jsonify({"service": "UZL BOT HOST", "status": "online"})
 
-# ============================================================
-# START
-# ============================================================
+# ----------------------- webhook setup -------------------------
+
+def configure_webhook():
+    if not BOT_TOKEN or not PUBLIC_BASE_URL:
+        return
+    url = f"{PUBLIC_BASE_URL}/telegram/webhook"
+    payload = {"url": url}
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    try:
+        tg("setWebhook", payload)
+    except Exception:
+        pass
 
 if __name__ == "__main__":
-    BOT_STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
-
-    # For production behind Render/reverse proxy, bind to 0.0.0.0
-    # and use the PORT supplied by the platform.
-    port = int(os.environ.get("PORT", "10000"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-    )
+    configure_webhook()
+    app.run(host="0.0.0.0", port=PORT)
